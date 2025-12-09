@@ -325,3 +325,166 @@ class TestCudaExport(unittest.TestCase):
             edge_program_manager,
             "SDPA kernel export with triton_kernel_mode=OFF failed",
         )
+
+    def test_whisper_decoder_int4_full_pass_chain(self):
+        """
+        Test CUDA export for Whisper-like decoder with INT4 quantization.
+
+        This test exercises the full CUDA backend pass chain:
+        1. CSEPass - Common subexpression elimination to merge preprocessing chains
+        2. FuseInt4WeightOnlyQuantMatmulPass - Fuses Q/K/V INT4 matmul operations
+        3. ReplaceEdgeOpWithTritonOpPass - Replaces SDPA with Triton kernels
+
+        The test creates a Whisper-like decoder layer with:
+        - Self-attention with Q/K/V projections (INT4 quantized, fuseable)
+        - Cross-attention with Q/K/V projections (INT4 quantized, fuseable)
+        - MLP with fc1/fc2 projections (INT4 quantized)
+        - SDPA for attention computation
+
+        This is a regression test to ensure the full pass chain works correctly,
+        particularly the _PermissiveVerifier fix that allows EdgeOpOverload,
+        OpOverloadPacket (triton.sdpa), and CustomOpDef types.
+        """
+        # Check for SM80+ (A100 or newer) required for INT4 tile_packed_to_4d format
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 8:
+            self.skipTest("INT4 tile_packed_to_4d format requires SM80+ (A100 or newer)")
+
+        try:
+            from torchao.quantization import Int4WeightOnlyConfig, quantize_
+        except ImportError:
+            self.skipTest("torchao not available")
+
+        # Whisper decoder dimensions (from whisper-large-v3-turbo)
+        hidden_size = 1280
+        num_heads = 20
+        head_dim = hidden_size // num_heads  # 64
+        intermediate_size = hidden_size * 4  # 5120
+        group_size = 128
+
+        class WhisperDecoderLayer(torch.nn.Module):
+            """Simplified Whisper decoder layer for testing INT4 fusion."""
+
+            def __init__(self):
+                super().__init__()
+                # Self-attention projections (Q/K/V should be fused)
+                self.self_attn_q_proj = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+                self.self_attn_k_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+                self.self_attn_v_proj = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+                self.self_attn_out_proj = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+
+                # Cross-attention projections (Q/K/V should be fused)
+                self.cross_attn_q_proj = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+                self.cross_attn_k_proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+                self.cross_attn_v_proj = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+                self.cross_attn_out_proj = torch.nn.Linear(hidden_size, hidden_size, bias=True)
+
+                # MLP (fc1/fc2)
+                self.fc1 = torch.nn.Linear(hidden_size, intermediate_size, bias=True)
+                self.fc2 = torch.nn.Linear(intermediate_size, hidden_size, bias=True)
+
+                # Layer norms
+                self.self_attn_layer_norm = torch.nn.LayerNorm(hidden_size)
+                self.cross_attn_layer_norm = torch.nn.LayerNorm(hidden_size)
+                self.final_layer_norm = torch.nn.LayerNorm(hidden_size)
+
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                encoder_hidden_states: torch.Tensor,
+            ) -> torch.Tensor:
+                batch_size, seq_len, _ = hidden_states.shape
+                encoder_seq_len = encoder_hidden_states.shape[1]
+
+                # Self-attention
+                residual = hidden_states
+                hidden_states = self.self_attn_layer_norm(hidden_states)
+
+                # Q/K/V projections (should be fused by FuseInt4WeightOnlyQuantMatmulPass)
+                q = self.self_attn_q_proj(hidden_states)
+                k = self.self_attn_k_proj(hidden_states)
+                v = self.self_attn_v_proj(hidden_states)
+
+                # Reshape for multi-head attention
+                q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+                k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+                v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
+                # SDPA (should be replaced with triton.sdpa by ReplaceEdgeOpWithTritonOpPass)
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+                )
+
+                attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+                hidden_states = self.self_attn_out_proj(attn_output)
+                hidden_states = residual + hidden_states
+
+                # Cross-attention
+                residual = hidden_states
+                hidden_states = self.cross_attn_layer_norm(hidden_states)
+
+                # Cross Q/K/V projections (should be fused)
+                q = self.cross_attn_q_proj(hidden_states)
+                k = self.cross_attn_k_proj(encoder_hidden_states)
+                v = self.cross_attn_v_proj(encoder_hidden_states)
+
+                q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+                k = k.view(batch_size, encoder_seq_len, num_heads, head_dim).transpose(1, 2)
+                v = v.view(batch_size, encoder_seq_len, num_heads, head_dim).transpose(1, 2)
+
+                # Cross-attention SDPA
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
+                )
+
+                attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+                hidden_states = self.cross_attn_out_proj(attn_output)
+                hidden_states = residual + hidden_states
+
+                # MLP
+                residual = hidden_states
+                hidden_states = self.final_layer_norm(hidden_states)
+                hidden_states = self.fc1(hidden_states)
+                hidden_states = torch.nn.functional.gelu(hidden_states)
+                hidden_states = self.fc2(hidden_states)
+                hidden_states = residual + hidden_states
+
+                return hidden_states
+
+        # Create model with bfloat16 (required for SDPA with Triton)
+        module = WhisperDecoderLayer().to(dtype=torch.bfloat16, device="cuda")
+        module.eval()
+
+        # Apply INT4 quantization with tile_packed_to_4d format
+        int4_config = Int4WeightOnlyConfig(
+            group_size=group_size,
+            int4_packing_format="tile_packed_to_4d",
+        )
+        quantize_(module, int4_config)
+
+        # Prepare inputs
+        batch_size = 1
+        seq_len = 16
+        encoder_seq_len = 1500  # Whisper encoder output length
+
+        hidden_states = torch.randn(
+            batch_size, seq_len, hidden_size,
+            dtype=torch.bfloat16, device="cuda"
+        )
+        encoder_hidden_states = torch.randn(
+            batch_size, encoder_seq_len, hidden_size,
+            dtype=torch.bfloat16, device="cuda"
+        )
+
+        inputs = (hidden_states, encoder_hidden_states)
+
+        # Export and lower - this exercises the full pass chain
+        edge_program_manager = self._export_to_cuda_with_lower(module, inputs)
+
+        self.assertIsNotNone(
+            edge_program_manager,
+            "Whisper decoder INT4 export with full pass chain failed"
+        )
