@@ -30,6 +30,9 @@
 #include <executorch/runtime/platform/compiler.h>
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/platform/profiler.h>
+#ifdef CUDA_AVAILABLE
+#include <cuda_runtime.h>
+#endif
 #include <executorch/schema/program_generated.h>
 
 namespace executorch {
@@ -226,6 +229,29 @@ struct Chain {
 };
 
 namespace {
+
+#ifdef CUDA_AVAILABLE
+bool is_cuda_pointer(const void* ptr) {
+  if (ptr == nullptr) {
+    return false;
+  }
+  cudaPointerAttributes attrs{};
+  if (cudaPointerGetAttributes(&attrs, ptr) != cudaSuccess) {
+    return false;
+  }
+#if CUDART_VERSION >= 10000
+  return attrs.type == cudaMemoryTypeDevice ||
+      attrs.type == cudaMemoryTypeManaged;
+#else
+  return attrs.memoryType == cudaMemoryTypeDevice ||
+      attrs.memoryType == cudaMemoryTypeManaged;
+#endif
+}
+#else
+inline bool is_cuda_pointer(const void* /*ptr*/) {
+  return false;
+}
+#endif
 
 Result<InstructionArgs> gen_instruction_arguments(
     MemoryAllocator* method_allocator,
@@ -1139,10 +1165,20 @@ Method::set_input(const EValue& input_evalue, size_t input_idx) {
         input_idx);
     auto tensor_meta = this->method_meta().input_tensor_meta(input_idx);
     if (tensor_meta->is_memory_planned()) {
-      ET_CHECK_OK_OR_RETURN_ERROR(
-          internal::copy_tensor_data(t_dst, t_src),
-          "Error copying tensor data at input %" ET_PRIsize_t,
-          input_idx);
+      // Only copy when source and destination are on the same device.
+      const bool src_device = is_cuda_pointer(t_src.const_data_ptr());
+      const bool dst_device = is_cuda_pointer(t_dst.const_data_ptr());
+      if (src_device == dst_device) {
+        ET_CHECK_OK_OR_RETURN_ERROR(
+            internal::copy_tensor_data(t_dst, t_src),
+            "Error copying tensor data at input %" ET_PRIsize_t,
+            input_idx);
+      } else {
+        ET_CHECK_OK_OR_RETURN_ERROR(
+            internal::share_tensor_data(t_dst, t_src),
+            "Error sharing tensor data at input %" ET_PRIsize_t,
+            input_idx);
+      }
     } else {
       ET_CHECK_OK_OR_RETURN_ERROR(
           internal::share_tensor_data(t_dst, t_src),
